@@ -1,0 +1,8 @@
+.env
+config.yaml
+file.txt
+file2.txt
+wc
+go.mod
+go.sum
+.vscode
