@@ -35,12 +35,13 @@ package cmd
 
 import (
 	"bufio"
-	"regexp"
-	"unicode"
-
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"unicode"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -54,10 +55,16 @@ type fileStats struct {
 	Bytes   int
 }
 
+type resultRoot struct {
+	stats fileStats
+	err   error
+}
+
 var (
 	countLetters bool
 	countWords   bool
 	countBytes   bool
+	outputFormat string
 )
 
 const (
@@ -65,7 +72,7 @@ const (
 	configWords    = "words"
 	configBytes    = "bytes"
 	configFormat   = "format"
-	configFileName = ".wcrc"
+	configFileName = "configYaml"
 )
 
 var rootCmd = &cobra.Command{
@@ -83,9 +90,9 @@ var rootCmd = &cobra.Command{
 wc file.txt -l -w           # Анализ одного файла
 wc file1.txt file2.txt -c   # Анализ нескольких файлов
 cat file.txt | wc -l -w     # Анализ из stdin`,
-	
+
 	Args: cobra.ArbitraryArgs,
-	Run:  func(cmd *cobra.Command, args []string) {
+	Run: func(cmd *cobra.Command, args []string) {
 		files := filterArgs(args)
 
 		if len(files) == 0 {
@@ -99,21 +106,33 @@ cat file.txt | wc -l -w     # Анализ из stdin`,
 		}
 
 		var totalStats fileStats
+		totalStats.Name = "TOTAL"
 
-		for _, filename := range files {
-			stats, err := calculateFileStats(filename)
-			if err != nil {
-				cmd.PrintErrln("Ошибка:", err)
-				continue
+		results := make([]resultRoot, len(files))
+		var wg sync.WaitGroup
+		wg.Add(len(files))
+
+		for i, filename := range files {
+			go func(i int, filename string) {
+				defer wg.Done()
+				stats, err := calculateFileStats(filename)
+				
+				results[i] = resultRoot{stats: stats, err: err}
+			}(i, filename)
+		}
+
+		wg.Wait()
+
+		for _,  res := range results {
+			if res.err != nil {
+				cmd.PrintErrln("Ошибка: ", res.err)
+			} else {
+				printStats(cmd, res.stats)
+				totalStats.Letters += res.stats.Letters
+				totalStats.Lines += res.stats.Lines
+				totalStats.Words += res.stats.Words
+				totalStats.Bytes += res.stats.Bytes
 			}
-
-			totalStats.Name    += "TOTAL"
-			totalStats.Letters += stats.Letters
-			totalStats.Lines   += stats.Lines
-			totalStats.Words   += stats.Words
-			totalStats.Bytes   += stats.Bytes
-
-			printStats(cmd, stats)
 		}
 
 		if len(files) > 1 {
@@ -126,15 +145,15 @@ cat file.txt | wc -l -w     # Анализ из stdin`,
 func init() {
 	cobra.OnInitialize(initConfig)
 
-	rootCmd.Flags().BoolP(configLetters,  "l",  false,  "Подсчет букв")
-	rootCmd.Flags().BoolP(configWords,    "w",  false,  "Подсчет слов")
-	rootCmd.Flags().BoolP(configBytes,    "b",  false,  "Подсчет байтов")
-	rootCmd.Flags().StringP(configFormat, "f",  "text", "Формат вывода (text|json|csv)")
+	rootCmd.Flags().BoolP(configLetters, "l", false, "Подсчет букв")
+	rootCmd.Flags().BoolP(configWords, "w", false, "Подсчет слов")
+	rootCmd.Flags().BoolP(configBytes, "b", false, "Подсчет байтов")
+	rootCmd.Flags().StringP(configFormat, "f", "text", "Формат вывода (text|json|csv)")
 
 	viper.BindPFlag(configLetters, rootCmd.Flags().Lookup(configLetters))
-	viper.BindPFlag(configWords,   rootCmd.Flags().Lookup(configWords))
-	viper.BindPFlag(configBytes,   rootCmd.Flags().Lookup(configBytes))
-	viper.BindPFlag(configFormat,  rootCmd.Flags().Lookup(configFormat))
+	viper.BindPFlag(configWords, rootCmd.Flags().Lookup(configWords))
+	viper.BindPFlag(configBytes, rootCmd.Flags().Lookup(configBytes))
+	viper.BindPFlag(configFormat, rootCmd.Flags().Lookup(configFormat))
 }
 
 func initConfig() {
@@ -142,8 +161,7 @@ func initConfig() {
 	viper.AutomaticEnv()
 
 	viper.SetConfigName(configFileName)
-	viper.AddConfigPath(".")
-	viper.AddConfigPath("$HOME")
+	viper.AddConfigPath("PATH")
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
@@ -151,6 +169,11 @@ func initConfig() {
 			return
 		}
 	}
+
+	countLetters = viper.GetBool(configLetters)
+	countWords = viper.GetBool(configWords)
+	countBytes = viper.GetBool(configBytes)
+	outputFormat = viper.GetString(configFormat)
 }
 
 func calculateFileStats(filename string) (fileStats, error) {
@@ -165,7 +188,7 @@ func calculateFileStats(filename string) (fileStats, error) {
 
 func calculateStats(r io.Reader, name string) (fileStats, error) {
 	bufReader := bufio.NewReader(r)
-	stats     := fileStats{Name: name}
+	stats := fileStats{Name: name}
 	wordRegex := regexp.MustCompile(`\p{L}+`)
 
 	for {
@@ -198,31 +221,49 @@ func calculateStats(r io.Reader, name string) (fileStats, error) {
 }
 
 func printStats(cmd *cobra.Command, stats fileStats) {
-	cmd.Printf("Файл:    %s\n", stats.Name)
-	
-	if countLetters || !anyFlagsSet() {
-		cmd.Printf("Letters: %d\n", stats.Letters)
+	switch outputFormat {
+
+	case "text":
+		cmd.Printf("Файл:    %s\n", stats.Name)
+		if countLetters || !anyFlagsSet() {
+			cmd.Printf("Letters: %d\n", stats.Letters)
+		}
+		if countWords || !anyFlagsSet() {
+			cmd.Printf("Words:   %d\n", stats.Words)
+		}
+		if countBytes || !anyFlagsSet() {
+			cmd.Printf("Bytes:   %d\n", stats.Bytes)
+		}
+		cmd.Printf("Lines:   %d\n", stats.Lines)
+		cmd.Println("──────────────────────────────")
+
+	case "json":
+		cmd.Printf(`{
+	"name":   "%s",
+	"letters": %d,
+	"words":   %d,
+	"bytes":   %d,
+	"lines":   %d,
+}`+"\n",
+			stats.Name, stats.Letters, stats.Words, stats.Bytes, stats.Lines)
+
+	case "csv":
+		cmd.Printf("name,letters,words,bytes,lines\n")
+		cmd.Printf("%s,%d,%d,%d,%d\n", stats.Name, stats.Letters, stats.Words, stats.Bytes, stats.Lines)
+
+	default:
+		cmd.Println("Неизвестный формат вывода.")
 	}
-	if countWords || !anyFlagsSet() {
-		cmd.Printf("Words:   %d\n", stats.Words)
-	}
-	if countBytes || !anyFlagsSet() {
-		cmd.Printf("Bytes:   %d\n", stats.Bytes)
-	}
-	
-	cmd.Printf("Lines:   %d\n",   stats.Lines)
-	cmd.Println("──────────────────────────────")
 }
 
 func anyFlagsSet() bool {
 	return countLetters || countWords || countBytes
 }
 
-// фильтр для отделения имен файлов от флагов
 func filterArgs(args []string) []string {
 	var files []string
 	for _, arg := range args {
-		if arg[0] != '-' {
+		if !strings.HasPrefix(arg, "-") {
 			files = append(files, arg)
 		}
 	}
@@ -231,6 +272,6 @@ func filterArgs(args []string) []string {
 
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1) 
+		os.Exit(1)
 	}
 }

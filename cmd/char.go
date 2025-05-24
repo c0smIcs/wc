@@ -1,11 +1,12 @@
 package cmd
 
 import (
-	"unicode"
 	"bufio"
 	"fmt"
 	"io"
 	"os"
+	"sync"
+	"unicode"
 
 	"github.com/spf13/cobra"
 )
@@ -13,6 +14,12 @@ import (
 type charStats struct {
 	Name    string
 	Letters int
+}
+
+type resultChar struct {
+	index int
+	stats charStats
+	err   error
 }
 
 var charCmd = &cobra.Command{
@@ -26,32 +33,49 @@ wc char *.txt            # Анализ нескольких файлов
 cat file.txt | wc char   # Анализ из stdin`,
 	Args: cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
-		var totalLetters int
-		var hasErrors bool
-
 		if len(args) == 0 {
 			stats, err := countLettersFromReader(os.Stdin, "stdin")
 			if err != nil {
 				cmd.PrintErrln("Ошибка", err)
 				os.Exit(1)
 			}
-
 			printCharStats(cmd, stats)
 			return
 		}
 
-		for _, filename := range args {
-			stats, err := countLettersInFile(filename)
-			if err != nil {
-				cmd.PrintErrf("Ошибка обработки файла %s: %v\n", filename, err)
-				hasErrors = true
-				continue
-			}
+		var wg sync.WaitGroup
+		ch := make(chan resultChar, len(args))
+		var hasErrors bool
+		var totalLetters int
 
-			totalLetters += stats.Letters
-			printCharStats(cmd, stats)
+		for i, filename := range args {
+			wg.Add(1)
+			go func(i int, filename string) {
+				defer wg.Done()
+				stats, err := countLettersInFile(filename)
+				ch <- resultChar{index: i, stats: stats, err: err}
+			}(i, filename)
 		}
 
+		go func() {
+			wg.Wait()
+			close(ch)
+		}()
+
+		results := make([]resultChar, len(args))
+		for res := range ch {
+			results[res.index] = res
+		}
+
+		for _, res := range results {
+			if res.err != nil {
+				cmd.PrintErrf("Ошибка обработки файла %s: %v\n", args[res.index], res.err)
+				hasErrors = true
+			} else {
+				printCharStats(cmd, res.stats)
+				totalLetters += res.stats.Letters
+			}
+		}
 		if len(args) > 1 {
 			cmd.Printf("\nВсего букв: %d\n", totalLetters)
 		}
@@ -74,21 +98,21 @@ func countLettersInFile(filename string) (charStats, error) {
 
 func countLettersFromReader(r io.Reader, name string) (charStats, error) {
 	scanner := bufio.NewScanner(r)
-	stats   := charStats{Name: name}
+	stats := charStats{Name: name}
 
-	const maxCapacity = 1024 * 1024 
+	const maxCapacity = 1024 * 1024
 	buf := make([]byte, maxCapacity)
 	scanner.Buffer(buf, maxCapacity)
 
 	scanner.Split(bufio.ScanRunes)
-	
+
 	for scanner.Scan() {
 		char := rune(scanner.Bytes()[0])
 		if unicode.IsLetter(char) {
 			stats.Letters++
 		}
 	}
-	
+
 	if err := scanner.Err(); err != nil {
 		return charStats{}, fmt.Errorf("Ошибка чтения: %w", err)
 	}
