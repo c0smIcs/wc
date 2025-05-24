@@ -1,7 +1,6 @@
 .env
 config.yaml
-file.txt
-file2.txt
+*.txt
 wc
 go.mod
 go.sum
